@@ -1,0 +1,45 @@
+# .clang-tidy — static analysis configuration for the trading engine.
+#
+# Philosophy: catch correctness and safety issues; suppress style noise.
+# The codebase uses several intentional patterns that naive linters flag:
+#   - [[nodiscard]] ignored in test helpers (explicit cast to void)
+#   - Reinterpret_cast in the pool allocator (placement new is correct here)
+#   - CRTP-style templates in SPSC queue
+
+Checks: >
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  bugprone-*,
+  concurrency-*,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -cppcoreguidelines-magic-numbers,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -readability-identifier-length,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -modernize-avoid-c-arrays,
+  -cppcoreguidelines-avoid-c-arrays
+
+WarningsAsErrors: >
+  clang-analyzer-*,
+  concurrency-*,
+  bugprone-use-after-move,
+  bugprone-dangling-handle,
+  bugprone-infinite-loop,
+  cppcoreguidelines-pro-type-member-init
+
+HeaderFilterRegex: 'include/.*\.hpp'
+
+CheckOptions:
+  - key: readability-function-cognitive-complexity.Threshold
+    value: '30'
+  - key: cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor
+    value: 'true'
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: 'std::function'

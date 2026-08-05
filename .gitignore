@@ -1,0 +1,12 @@
+build/
+.cache/
+*.o
+*.a
+*.so
+compile_commands.json
+.clangd/
+.vscode/
+*.swp
+*~
+perf_out/
+build_test/

@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # ── Release build + all tests ─────────────────────────────────────────────
+  build-and-test:
+    name: Build & Test (${{ matrix.build_type }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, RelWithDebInfo]
+        compiler: [g++-12, clang++-16]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build ${{ matrix.compiler }}
+
+      - name: Configure
+        run: |
+          CXX=${{ matrix.compiler }} cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+  # ── ThreadSanitizer — concurrent SPSC and matching correctness ────────────
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build g++-12
+
+      - name: Configure (TSan)
+        run: |
+          CXX=g++-12 cmake -S . -B build-tsan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DTSAN=ON
+
+      - name: Build
+        run: cmake --build build-tsan --parallel $(nproc)
+
+      - name: Test under TSan
+        # TSan may report false positives on FIFO scheduler interactions —
+        # suppress known-safe suppressions via TSAN_OPTIONS.
+        env:
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+        run: ctest --test-dir build-tsan --output-on-failure --timeout 180
+
+  # ── AddressSanitizer ─────────────────────────────────────────────────────
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build g++-12
+
+      - name: Configure (ASan)
+        run: |
+          CXX=g++-12 cmake -S . -B build-asan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DASAN=ON
+
+      - name: Build
+        run: cmake --build build-asan --parallel $(nproc)
+
+      - name: Test under ASan
+        env:
+          ASAN_OPTIONS: "halt_on_error=1 detect_leaks=1"
+        run: ctest --test-dir build-asan --output-on-failure --timeout 180
+
+  # ── Static analysis ───────────────────────────────────────────────────────
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build clang-16 clang-tidy-16
+
+      - name: Configure (compile_commands)
+        run: |
+          CXX=clang++-16 cmake -S . -B build-tidy \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Run clang-tidy
+        run: |
+          clang-tidy-16 \
+            -p build-tidy \
+            --warnings-as-errors='*' \
+            include/core/*.hpp \
+            include/util/*.hpp \
+            src/core/*.cpp \
+            src/util/*.cpp \
+            src/main.cpp
+
+  # ── Benchmark smoke (sanity-check throughput hasn't regressed badly) ──────
+  bench-smoke:
+    name: Benchmark Smoke
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build g++-12
+
+      - name: Configure & Build
+        run: |
+          CXX=g++-12 cmake -S . -B build-bench -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-bench --parallel $(nproc)
+
+      - name: Throughput smoke (must exceed 1M msgs/sec in CI)
+        run: |
+          output=$(./build-bench/bench_throughput)
+          echo "$output"
+          # Extract throughput and assert > 1.0 M/s (CI has no isolated cores).
+          rate=$(echo "$output" | grep "Throughput (out)" | grep -oP '[0-9]+\.[0-9]+')
+          python3 -c "
+          rate = float('$rate')
+          assert rate > 1.0, f'Throughput regression: {rate:.2f} M/s < 1.0 M/s threshold'
+          print(f'Throughput OK: {rate:.2f} M msgs/sec')
+          "
