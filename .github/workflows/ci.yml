@@ -123,6 +123,39 @@ jobs:
           assert rate > 1.0, f'Throughput regression: {rate:.2f} M/s < 1.0 M/s threshold'
           print(f'Throughput OK: {rate:.2f} M msgs/sec')
           "
+  # ── Differential fuzzer, longer run ───────────────────────────────────────
+  # ctest already runs the model-based test_conservation at 1M events across
+  # 5 seeds (see CMakeLists.txt). This job runs one 10M-event pass and
+  # reports wall-clock time + pass/fail explicitly, since that number is the
+  # headline correctness claim in the README.
+  conservation-long:
+    name: Conservation (10M events)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build g++-12
+
+      - name: Configure & Build
+        run: |
+          CXX=g++-12 cmake -S . -B build-cons -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-mavx2"
+          cmake --build build-cons --target test_conservation --parallel $(nproc)
+
+      - name: Run 10M-event differential test
+        run: |
+          start=$(date +%s)
+          ./build-cons/test_conservation 0x5EED 10000000
+          status=$?
+          end=$(date +%s)
+          echo "wall_clock_seconds=$((end - start))"
+          exit $status
+
   readme-consistency:
     runs-on: ubuntu-22.04
     steps:

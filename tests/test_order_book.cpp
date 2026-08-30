@@ -179,6 +179,98 @@ static void test_market_order() {
     CHECK(fills[0].qty == 150, "Full fill for market order");
 }
 
+static void test_modify_decrease_keeps_priority() {
+    std::vector<FillRecord> fills;
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
+
+    // Two resting sells at the same price, order 1 first.
+    book.add_order(make_order(1, Side::Sell, to_price(50.0), 100));
+    book.add_order(make_order(2, Side::Sell, to_price(50.0), 100));
+
+    // Shrink order 1 — it must keep its place at the front of the queue.
+    bool ok = book.modify_order(1, 40);
+    CHECK(ok, "Modify (decrease) accepted");
+
+    book.add_order(make_order(3, Side::Buy, to_price(50.0), 40));
+    CHECK(fills.size() == 1, "One fill");
+    if (!fills.empty())
+        CHECK(fills[0].contra_id == 1, "Decrease keeps priority — still filled against order 1");
+}
+
+static void test_modify_increase_loses_priority() {
+    std::vector<FillRecord> fills;
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
+
+    // Two resting sells at the same price, order 1 first.
+    book.add_order(make_order(1, Side::Sell, to_price(50.0), 100));
+    book.add_order(make_order(2, Side::Sell, to_price(50.0), 100));
+
+    // Grow order 1 — it must move to the back of the queue.
+    bool ok = book.modify_order(1, 150);
+    CHECK(ok, "Modify (increase) accepted");
+
+    // Aggressive buy for 100 should now fill against order 2 first.
+    book.add_order(make_order(3, Side::Buy, to_price(50.0), 100));
+    CHECK(fills.size() == 1, "One fill");
+    if (!fills.empty())
+        CHECK(fills[0].contra_id == 2, "Increase loses priority — order 2 fills first");
+
+    // A further buy for 150 should then exhaust order 1 (now at the back).
+    book.add_order(make_order(4, Side::Buy, to_price(50.0), 150));
+    bool saw_order1 = false;
+    for (auto& f : fills) if (f.contra_id == 1) saw_order1 = true;
+    CHECK(saw_order1, "Order 1 still fillable after losing priority, just later");
+}
+
+static void test_ioc_remainder_expires() {
+    std::vector<FillRecord> fills;
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
+
+    book.add_order(make_order(1, Side::Sell, to_price(100.0), 50));
+    auto ioc = make_order(2, Side::Buy, to_price(100.0), 200, OrderType::IOC);
+    bool ok = book.add_order(ioc);
+    CHECK(ok, "IOC accepted");
+    CHECK(fills.size() == 1 && fills[0].qty == 50, "IOC fills the available 50");
+
+    // The unfilled 150 must NOT rest in the book.
+    BestQuote q = book.best_quote();
+    CHECK(q.bid_price == PRICE_INVALID, "IOC remainder does not rest — no resting bid");
+}
+
+static void test_fok_atomicity() {
+    // FOK with insufficient liquidity: must reject with zero fills, not
+    // partially execute.
+    {
+        std::vector<FillRecord> fills;
+        BookFixture fx(fills);
+        OrderBook& book = fx.book;
+
+        book.add_order(make_order(1, Side::Sell, to_price(100.0), 50));
+        auto fok = make_order(2, Side::Buy, to_price(100.0), 200, OrderType::FOK);
+        bool ok = book.add_order(fok);
+        CHECK(!ok, "FOK rejected when liquidity insufficient");
+        CHECK(fills.empty(), "FOK rejection leaves zero fills (atomic, not partial)");
+    }
+    // FOK with sufficient liquidity: must fully fill, nothing rests.
+    {
+        std::vector<FillRecord> fills;
+        BookFixture fx(fills);
+        OrderBook& book = fx.book;
+
+        book.add_order(make_order(1, Side::Sell, to_price(100.0), 200));
+        auto fok = make_order(2, Side::Buy, to_price(100.0), 150, OrderType::FOK);
+        bool ok = book.add_order(fok);
+        CHECK(ok, "FOK accepted when liquidity sufficient");
+        CHECK(fills.size() == 1 && fills[0].qty == 150, "FOK fully filled in one shot");
+
+        BestQuote q = book.best_quote();
+        CHECK(q.bid_price == PRICE_INVALID, "FOK never rests a remainder");
+    }
+}
+
 // ── Property-based test: random order stream ──────────────────────────────────
 
 static void test_invariants_random() {
@@ -232,6 +324,10 @@ int main() {
     test_partial_fill();
     test_spread();
     test_market_order();
+    test_modify_decrease_keeps_priority();
+    test_modify_increase_loses_priority();
+    test_ioc_remainder_expires();
+    test_fok_atomicity();
     test_invariants_random();
 
     printf("\nResults: %d passed, %d failed\n", passed, failed);

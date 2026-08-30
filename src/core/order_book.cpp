@@ -193,13 +193,25 @@ bool OrderBook::add_order(const Order& order) noexcept {
     Side& side  = is_bid ? bids_ : asks_;
 
     int32_t lvl_idx = side.find_level(o.price, is_bid);
+    bool created_level = false;
     if (lvl_idx < 0) {
         lvl_idx = side.insert_level(o.price, is_bid);
         if (lvl_idx < 0) { ++stat_rejected_; return false; }
+        created_level = true;
     }
 
     uint32_t slot = slots_.alloc();
-    if (slot == NULL_IDX) { ++stat_rejected_; return false; }
+    if (slot == NULL_IDX) {
+        // Roll back the level we just created — otherwise a capacity
+        // rejection here leaves a permanent empty price level behind
+        // (order_count=0, qty=0) that pollutes best_quote()/find_level()
+        // and silently eats one of the kMaxLevels slots. Only roll back
+        // when we created it: an existing level with other resting
+        // orders must never be touched by this failure path.
+        if (created_level) side.remove_level(static_cast<uint32_t>(lvl_idx));
+        ++stat_rejected_;
+        return false;
+    }
 
     slots_.ids[slot]        = o.id;
     slots_.qtys[slot]       = o.qty_remaining;
@@ -259,17 +271,45 @@ bool OrderBook::modify_order(OrderId order_id, Qty new_qty) noexcept {
     if (lvl < 0) { index_.remove(order_id); return false; }
 
     const Qty old_qty = slots_.qtys[slot];
-    if (new_qty >= old_qty) {
-        side.qtys[lvl]    += (new_qty - old_qty);
+    const uint32_t lvl_u = static_cast<uint32_t>(lvl);
+
+    if (new_qty > old_qty) {
+        // Quantity increase loses time priority: unlink from the current
+        // spot in the level's FIFO and re-append at the tail, exactly as if
+        // it were a brand-new order arriving at this price. Mirrors the
+        // append logic in add_order() so the two stay in sync.
+        {
+            const uint32_t prev = slots_.prevs[slot];
+            const uint32_t next = slots_.nexts[slot];
+            if (prev != NULL_IDX) slots_.nexts[prev] = next;
+            else                  side.head_idxs[lvl_u] = next;
+            if (next != NULL_IDX) slots_.prevs[next] = prev;
+            else                  side.tail_idxs[lvl_u] = prev;
+        }
+        if (side.head_idxs[lvl_u] == NULL_IDX) {
+            slots_.prevs[slot]    = NULL_IDX;
+            slots_.nexts[slot]    = NULL_IDX;
+            side.head_idxs[lvl_u] = slot;
+            side.tail_idxs[lvl_u] = slot;
+        } else {
+            const uint32_t old_tail = side.tail_idxs[lvl_u];
+            slots_.nexts[old_tail] = slot;
+            slots_.prevs[slot]     = old_tail;
+            slots_.nexts[slot]     = NULL_IDX;
+            side.tail_idxs[lvl_u]  = slot;
+        }
+        side.qtys[lvl_u]  += (new_qty - old_qty);
         slots_.qtys[slot]  = new_qty;
-    } else {
-        side.qtys[lvl]    -= (old_qty - new_qty);
+    } else if (new_qty < old_qty) {
+        // Decrease keeps queue position — correct per price-time priority.
+        side.qtys[lvl_u]  -= (old_qty - new_qty);
         slots_.qtys[slot]  = new_qty;
         if (new_qty == 0) {
-            remove_order_from_level(side_idx, static_cast<uint32_t>(lvl), slot);
+            remove_order_from_level(side_idx, lvl_u, slot);
             index_.remove(order_id);
         }
     }
+    // new_qty == old_qty: no-op, priority unaffected.
     return true;
 }
 

@@ -92,7 +92,23 @@ target_link_libraries(bench_multisymbol PRIVATE engine_core)
 
 add_executable(test_conservation tests/test_conservation.cpp)
 target_link_libraries(test_conservation PRIVATE engine_core)
-add_test(NAME Conservation COMMAND test_conservation 1 1000000)
+# Multiple seeds at 1M events each in CI (see LIMITATIONS.md / README
+# Correctness section for what's checked after every event). A single
+# seed can miss an ordering-dependent bug — see bug #4 in the README,
+# which a single fixed seed happened not to reach.
+add_test(NAME Conservation-Seed1 COMMAND test_conservation 1 1000000)
+add_test(NAME Conservation-Seed2 COMMAND test_conservation 2 1000000)
+add_test(NAME Conservation-Seed3 COMMAND test_conservation 3 1000000)
+add_test(NAME Conservation-Seed4 COMMAND test_conservation 4 1000000)
+add_test(NAME Conservation-Seed5 COMMAND test_conservation 5 1000000)
+set_tests_properties(
+    Conservation-Seed1 Conservation-Seed2 Conservation-Seed3
+    Conservation-Seed4 Conservation-Seed5
+    PROPERTIES TIMEOUT 120
+)
+# A longer (10M-event) run is not part of the default ctest pass — same
+# binary, invoked with a bigger event count and a longer timeout from a
+# dedicated CI job (see .github/workflows/ci.yml: conservation-long).
 
 add_executable(test_histogram tests/test_histogram.cpp)
 target_link_libraries(test_histogram PRIVATE engine_core)

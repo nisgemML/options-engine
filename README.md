@@ -17,21 +17,42 @@ does not do is listed in [LIMITATIONS.md](LIMITATIONS.md).
 
 The book is checked against an independent reference model
 (`std::map<Price, deque<Order>>`, written from the spec) on **1,000,000
-random events per seed** — limit, market, IOC, FOK, cancel, modify — with
-equality asserted after every event on:
+random events per seed, across 5 seeds in CI** (plus a 10,000,000-event
+run in a dedicated CI job) — limit, market, IOC, FOK, cancel, modify
+(both increases and decreases) — with equality asserted after every event
+on:
 
 - the exact fill sequence (aggressor, passive, price, qty), which is what
-  enforces price-time priority;
+  enforces price-time priority, including priority loss on a modify-up;
 - best bid/ask;
 - no crossed book;
 - quantity conservation: `submitted == 2·filled + resting + cancelled + rejected + expired`.
 
+The reference model also mirrors the engine's fixed order-capacity limit
+(`OrderBook::kMaxOrders`), so a long run diverging only because it hit
+that documented boundary isn't mistaken for a bug.
+
 `tests/test_conservation.cpp`. Runs in CI under ASan, UBSan, and TSan.
 
-This test found three bugs in the previous release, all now fixed:
+This test found five bugs, all now fixed:
 1. an unfilled **market order was booked as a resting limit** at its price;
 2. **IOC/FOK ignored their limit price** and swept through the book like a market order;
-3. **FOK was not atomic** — it executed partial fills and then reported a reject.
+3. **FOK was not atomic** — it executed partial fills and then reported a reject;
+4. **`modify_order` kept queue position on a quantity increase**, instead of
+   losing priority as real exchange semantics require. Found by extending
+   the fuzzer's modify generator to exercise increases (previously
+   decrease-only) and the reference model's `modify_in` to match — the old
+   code then failed the fill-sequence check at a fixed, reproducible seed;
+5. **capacity rejection could orphan an empty price level.** `add_order`
+   inserts a new price level *before* checking whether a slot is available
+   for the order; if the slot pool was full (`kMaxOrders` = 65,536), the
+   function returned "rejected" but left the just-created, empty level
+   sitting in the book — corrupting `best_quote()` and permanently
+   consuming one of the 4,096 level slots. Found only once the model was
+   made capacity-aware (previously it had no order cap, so it never ran
+   long enough in the same process to hit this) and the fuzzer was run
+   past 65,536 concurrently-resting orders — the 1M-event/seed default
+   never gets there; the 10M-event CI job does.
 
 ---
 
@@ -249,13 +270,14 @@ ctest --test-dir build --output-on-failure
 
 | Suite | Assertions | What it covers |
 |-------|-----------|----------------|
-| `test_order_book` | 22 | Price-time priority, FIFO, cancel, partial fills, 100K-event property invariant |
+| `test_order_book` | 37 | Price-time priority, FIFO, cancel, partial fills, modify increase/decrease priority, IOC remainder expiry, FOK atomicity, 100K-event property invariant |
 | `test_spsc` | 12 | 2M-item FIFO ordering, wrap-around stress, concurrent — TSan-clean |
 | `test_mpmc` | 24 | 1P×1C through 8P×4C — every item received exactly once |
 | `test_matching` | 8 | End-to-end cross, cancel-before-match, multi-symbol isolation |
 | `test_allocator` | 84 | Exhaust/recover, free-list integrity, 1M alloc/free cycles |
 | `test_histogram` | 21 | Bucket indexing, percentile accuracy, concurrent recording |
-| **Total** | **171** | **0 failures** |
+| `test_conservation` | 1M events × 5 seeds | Model-based differential fuzzer — see Correctness above |
+| **Total (unit/property)** | **186** | **0 failures** |
 
 ---
 
@@ -266,8 +288,10 @@ Plugging in DPDK or kernel-bypass UDP is a one-function change.
 
 **Persistence:** WAL to pmem/NVMe left out to keep the matching path unobscured.
 
-**Multi-symbol parallelism:** Each `OrderBook` has no shared state. Per-symbol
-threads are a mechanical change to `MatchingEngine::register_symbol`.
+**Multi-symbol parallelism** is implemented (`MultiSymbolEngine`, one
+pinned thread per shard — see `bench/bench_multisymbol.cpp` and
+PROFILING.md §4). What's still out of scope is anything *cross-symbol*:
+combo/spread books, position limits by underlying — see LIMITATIONS.md.
 
 **Risk / pre-trade checks:** Fat-finger and position limits live between
 ingestion and matching — architecturally uninteresting comparisons.

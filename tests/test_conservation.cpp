@@ -35,6 +35,14 @@ struct RefBook {
     std::map<Price, std::deque<RefOrder>, std::greater<Price>> bids;  // best first
     std::map<Price, std::deque<RefOrder>, std::less<Price>>    asks;  // best first
     std::vector<Fill> fills;
+    // Mirrors OrderBook::kMaxOrders so the model rejects resting capacity
+    // exhaustion the same way the engine does — without this, a run long
+    // enough to fill the fixed-size slot pool diverges from an "engine
+    // rejected a resting add" for a reason that has nothing to do with
+    // correctness (it's the documented fixed-capacity limit in
+    // LIMITATIONS.md, not a bug). Tracked incrementally so it stays O(1)
+    // per event instead of walking both maps every check.
+    size_t resting_count = 0;
 
     template<typename Passive>
     Qty sweep(OrderId id, Qty qty, Price limit, bool is_buy, bool limited, Passive& side) {
@@ -47,7 +55,7 @@ struct RefBook {
                 Qty f = std::min(qty, q.front().rem);
                 fills.push_back({id, q.front().id, px, f});
                 qty -= f; q.front().rem -= f;
-                if (q.front().rem == 0) q.pop_front();
+                if (q.front().rem == 0) { q.pop_front(); --resting_count; }
             }
             if (q.empty()) side.erase(it);
         }
@@ -63,9 +71,13 @@ struct RefBook {
         return total;
     }
 
-    // Returns {resting_qty, filled_qty, rejected(bool)}
-    struct Outcome { Qty resting, filled; bool rejected; };
-    Outcome add(const Order& o) {
+    // Returns {resting_qty, filled_qty, rejected, capacity_rejected}.
+    // `rejected` is FOK-style: atomic, zero fills. `capacity_rejected` means
+    // the order matched whatever it could (possibly zero) and then found no
+    // free slot to rest the remainder in — mirrors OrderBook::add_order,
+    // which allocates a resting slot only *after* matching.
+    struct Outcome { Qty resting, filled; bool rejected; bool capacity_rejected = false; };
+    Outcome add(const Order& o, size_t max_orders) {
         bool buy = o.is_buy();
         bool limited = o.type != OrderType::Market;
         if (o.type == OrderType::FOK) {
@@ -76,7 +88,9 @@ struct RefBook {
                       : sweep(o.id, o.qty, o.price, buy, limited, bids);
         Qty filled = o.qty - rem;
         if (rem > 0 && o.type == OrderType::Limit) {
+            if (resting_count >= max_orders) return {0, filled, false, true};
             if (buy) bids[o.price].push_back({o.id, rem}); else asks[o.price].push_back({o.id, rem});
+            ++resting_count;
             return {rem, filled, false};
         }
         return {0, filled, false};   // market/IOC remainder expires, FOK fully filled
@@ -84,14 +98,31 @@ struct RefBook {
     template<typename S> bool erase_from(S& side, OrderId id, Qty* out) {
         for (auto it = side.begin(); it != side.end(); ++it)
             for (auto q = it->second.begin(); q != it->second.end(); ++q)
-                if (q->id == id) { *out = q->rem; it->second.erase(q); if (it->second.empty()) side.erase(it); return true; }
+                if (q->id == id) { *out = q->rem; it->second.erase(q); if (it->second.empty()) side.erase(it); --resting_count; return true; }
         return false;
     }
     bool cancel(OrderId id, Qty* out) { return erase_from(bids, id, out) || erase_from(asks, id, out); }
+    // delta is only meaningful (non-negative) when nq <= old rem; the driver
+    // only consumes it on the decrease path. On increase the order loses
+    // time priority: erase and re-append at the back of the same level's
+    // deque, matching the engine's re-link-at-tail behavior. resting_count
+    // is unaffected by a plain move; it only changes on decrease-to-zero.
     template<typename S> bool modify_in(S& side, OrderId id, Qty nq, Qty* delta) {
         for (auto it = side.begin(); it != side.end(); ++it)
             for (auto q = it->second.begin(); q != it->second.end(); ++q)
-                if (q->id == id) { *delta = q->rem - nq; q->rem = nq; if (nq == 0) { it->second.erase(q); if (it->second.empty()) side.erase(it);} return true; }
+                if (q->id == id) {
+                    *delta = q->rem - nq;
+                    if (nq > q->rem) {
+                        RefOrder moved{q->id, nq};
+                        it->second.erase(q);
+                        it->second.push_back(moved);
+                    } else {
+                        q->rem = nq;
+                        if (nq == 0) { it->second.erase(q); --resting_count; }
+                    }
+                    if (it->second.empty()) side.erase(it);
+                    return true;
+                }
         return false;
     }
     template<typename S> bool peek_in(S& side, OrderId id, Qty* out) {
@@ -155,7 +186,7 @@ int main(int argc, char** argv) {
             if (getenv("VERBOSE")) printf("[%zu] ADD id=%llu %s %s px=%.2f qty=%u\n", i, (unsigned long long)o.id,
                 o.is_buy() ? "BUY" : "SELL", o.type == OrderType::Limit ? "LMT" : o.type == OrderType::Market ? "MKT" : o.type == OrderType::IOC ? "IOC" : "FOK", from_price(o.price), o.qty);
             bool ok = book.add_order(o);
-            auto out = ref.add(o);
+            auto out = ref.add(o, OrderBook::kMaxOrders);
             if (getenv("VERBOSE")) {
                 for (size_t k = fills_before; k < engine_fills.size(); ++k) printf("     eng fill %llu x %llu px=%.2f q=%u\n", (unsigned long long)engine_fills[k].aggr, (unsigned long long)engine_fills[k].passive, from_price(engine_fills[k].px), engine_fills[k].qty);
                 for (size_t k = ref_before; k < ref.fills.size(); ++k) printf("     ref fill %llu x %llu px=%.2f q=%u\n", (unsigned long long)ref.fills[k].aggr, (unsigned long long)ref.fills[k].passive, from_price(ref.fills[k].px), ref.fills[k].qty);
@@ -170,6 +201,14 @@ int main(int argc, char** argv) {
                 if (ok) fail(i, "engine accepted FOK the model rejected");
                 if (eng_filled) fail(i, "FOK executed partial fills before rejecting (must be atomic)");
                 rejected += o.qty - eng_filled;
+            } else if (out.capacity_rejected) {
+                // Slot pool exhausted (kMaxOrders): whatever matched before
+                // hitting capacity must still agree; the remainder is lost
+                // (not resting) rather than expiring IOC-style, but goes in
+                // the same conservation bucket since neither books it.
+                if (ok) fail(i, "engine accepted an order the model capacity-rejected");
+                if (eng_filled != out.filled) fail(i, "filled qty differs from model (capacity path)");
+                expired += o.qty - eng_filled;
             } else {
                 if (!ok) fail(i, "engine rejected an order the model accepted");
                 if (eng_filled != out.filled) fail(i, "filled qty differs from model");
@@ -187,22 +226,28 @@ int main(int argc, char** argv) {
             if (ok != ref_ok) fail(i, "cancel result differs from model");
             if (ok) cancelled += rem;
         } else {
-            // ── Modify (qty down only, as the engine API allows) ──
+            // ── Modify (qty up or down) ──
+            // Decrease keeps queue position. Increase loses time priority —
+            // both the engine (modify_order) and the model (modify_in) move
+            // the order to the back of its level's queue on increase, so
+            // the fill-sequence check below is what actually proves the
+            // priority-loss semantics, not just the qty bookkeeping.
             size_t k = rng() % live.size();
             OrderId id = live[k];
-            // Only decreases: the engine modifies in place and keeps queue
-            // position, which is only correct for a reduction. An increase
-            // must lose priority (see LIMITATIONS.md) and is not exercised.
             Qty rem = 0, delta = 0;
             Qty nq = 0;
             bool have = ref.peek(id, &rem);
-            if (have) nq = Qty(rng() % (rem + 1));   // 0 → effectively cancel
-            if (getenv("VERBOSE")) printf("[%zu] MODIFY id=%llu -> %u\n", i, (unsigned long long)id, nq);
+            if (have) {
+                if (rng() % 100 < 60) nq = Qty(rng() % (rem + 1));                 // decrease/same, incl. 0 = cancel
+                else                  nq = Qty(rem + 1 + rng() % (rem + 1));       // strict increase
+            }
+            if (getenv("VERBOSE")) printf("[%zu] MODIFY id=%llu %u -> %u\n", i, (unsigned long long)id, rem, nq);
             bool ref_ok = have && ref.modify(id, nq, &delta);
             if (ref_ok) {
                 bool ok = book.modify_order(id, nq);
                 if (!ok) fail(i, "modify rejected by engine, accepted by model");
-                cancelled += delta;
+                if (nq >= rem) submitted += (nq - rem);   // increase = extra qty entering the book
+                else            cancelled += delta;        // decrease = qty leaves the ledger as cancelled
                 if (nq == 0) { live[k] = live.back(); live.pop_back(); }
             } else {
                 live[k] = live.back(); live.pop_back();   // stale id; drop it
