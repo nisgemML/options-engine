@@ -1,9 +1,3 @@
-// bench/bench_replay.cpp — generate a synthetic trace and replay it,
-// reporting a full latency histogram using LatencyHistogram.
-//
-// This is the kind of benchmark you'd run before and after a refactor
-// to validate that latency characteristics haven't regressed.
-
 #include "core/matching_engine.hpp"
 #include "core/replay.hpp"
 #include "util/histogram.hpp"
@@ -12,8 +6,68 @@
 #include <random>
 #include <vector>
 #include <cstring>
+#include <chrono>
+#include <deque>
+#include <map>
+#include <unordered_map>
+#include <algorithm>
 
 using namespace engine;
+
+// ── Naive std::map reference implementation ──────────────────────────────────
+// Used to contextualise the engine's latency numbers.
+// The "correct but slow" reference — contextualises the engine's numbers.
+struct NaiveBook {
+    using PriceMap = std::map<Price, std::deque<std::pair<OrderId,Qty>>>;
+    std::map<Price, std::deque<std::pair<OrderId,Qty>>, std::greater<Price>> bids;
+    std::map<Price, std::deque<std::pair<OrderId,Qty>>, std::less<Price>>    asks;
+    std::unordered_map<OrderId, std::pair<Price, uint8_t>> index_;
+    uint64_t fill_count = 0;
+
+    template<typename Map>
+    void sweep(Map& passive, OrderId id, Price limit, bool has_limit, Qty& qty) {
+        while (qty > 0 && !passive.empty()) {
+            auto it = passive.begin();
+            if (has_limit && (passive.key_comp()(limit, it->first))) break;
+            auto& q = it->second;
+            while (qty > 0 && !q.empty()) {
+                Qty f = std::min(qty, q.front().second);
+                qty -= f; q.front().second -= f; ++fill_count;
+                if (!q.front().second) { index_.erase(q.front().first); q.pop_front(); }
+            }
+            if (q.empty()) passive.erase(it);
+        }
+    }
+    void add(OrderId id, Side side, Price px, Qty qty) {
+        bool buy = side == Side::Buy;
+        if (buy) sweep(asks, id, px, true, qty); else sweep(bids, id, px, true, qty);
+        if (qty > 0) {
+            if (buy) bids[px].push_back({id, qty}); else asks[px].push_back({id, qty});
+            index_[id] = {px, uint8_t(buy ? 0u : 1u)};
+        }
+    }
+    void cancel(OrderId id) {
+        auto it = index_.find(id);
+        if (it == index_.end()) return;
+        auto [px, sd] = it->second;
+        auto erase_from = [&](auto& map) {
+            auto lit = map.find(px);
+            if (lit == map.end()) return;
+            auto& q = lit->second;
+            q.erase(std::remove_if(q.begin(), q.end(), [id](auto& p){ return p.first == id; }), q.end());
+            if (q.empty()) map.erase(lit);
+        };
+        if (sd == 0) erase_from(bids); else erase_from(asks);
+        index_.erase(it);
+    }
+};
+
+// bench/bench_replay.cpp — generate a synthetic trace and replay it,
+// reporting a full latency histogram using LatencyHistogram.
+//
+// This is the kind of benchmark you'd run before and after a refactor
+// to validate that latency characteristics haven't regressed.
+
 
 // Generate a synthetic trace that mimics realistic order flow:
 //   - Resting limit orders from market makers (70%)
@@ -128,5 +182,36 @@ int main(int argc, char** argv) {
     }
 
     engine.stop();
+
+    // ── Naive std::map baseline ───────────────────────────────────────────────
+    printf("\n[Naive std::map reference — same trace, single thread]\n");
+    {
+        NaiveBook book;
+        using namespace engine;
+        auto t0 = std::chrono::steady_clock::now();
+
+        // Re-read the trace.
+        FILE* f = fopen(trace_path, "rb");
+        if (f) {
+            struct { uint64_t ts; MarketDataMsg msg; } ev;
+            size_t n = 0;
+            while (fread(&ev, sizeof(ev), 1, f) == 1) {
+                if (ev.msg.msg_type == MarketDataMsg::Type::NewOrder) {
+                    book.add(ev.msg.order_id, ev.msg.side, ev.msg.price, ev.msg.qty);
+                } else if (ev.msg.msg_type == MarketDataMsg::Type::CancelOrder) {
+                    book.cancel(ev.msg.order_id);
+                }
+                ++n;
+            }
+            fclose(f);
+            double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            printf("  Events    : %zu\n", n);
+            printf("  Fills     : %llu\n", (unsigned long long)book.fill_count);
+            printf("  Throughput: %.2f M msg/sec\n", n / elapsed / 1e6);
+            printf("  vs engine : see MaxSpeed row above\n");
+        }
+    }
+
     return 0;
 }

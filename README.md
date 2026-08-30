@@ -1,31 +1,60 @@
-# options-engine
+# lob-engine
 
-A from-scratch C++20 options matching engine targeting sub-100ns order-to-fill
-latency on Linux x86-64. Full exchange architecture: market data ingestion,
-limit order book with AVX2 SIMD level search, matching engine, execution layer
-— connected by lock-free SPSC queues with no heap allocation on the hot path.
+A from-scratch C++20 limit-order-book matching engine for Linux x86-64:
+struct-of-arrays price levels, AVX2 level search, intrusive per-level order
+lists, a fixed pool with free-list, and lock-free SPSC ingress. Zero heap
+allocation, zero mutexes, zero syscalls on the matching path.
+
+This is a single-symbol book plus the plumbing around it. What it deliberately
+does not do is listed in [LIMITATIONS.md](LIMITATIONS.md).
+
+> Formerly published as `options-engine`. The core is instrument-agnostic and
+> the old name overstated it; renamed to say what it is.
+
+---
+
+## Correctness
+
+The book is checked against an independent reference model
+(`std::map<Price, deque<Order>>`, written from the spec) on **1,000,000
+random events per seed** — limit, market, IOC, FOK, cancel, modify — with
+equality asserted after every event on:
+
+- the exact fill sequence (aggressor, passive, price, qty), which is what
+  enforces price-time priority;
+- best bid/ask;
+- no crossed book;
+- quantity conservation: `submitted == 2·filled + resting + cancelled + rejected + expired`.
+
+`tests/test_conservation.cpp`. Runs in CI under ASan, UBSan, and TSan.
+
+This test found three bugs in the previous release, all now fixed:
+1. an unfilled **market order was booked as a resting limit** at its price;
+2. **IOC/FOK ignored their limit price** and swept through the book like a market order;
+3. **FOK was not atomic** — it executed partial fills and then reported a reject.
 
 ---
 
 ## Benchmark Results
 
-Measured on a shared container without core isolation or `SCHED_FIFO`.
-See [PROFILING.md](PROFILING.md) for methodology, cache analysis, and predicted
-bare-metal numbers. See [docs/linux-tuning.md](docs/linux-tuning.md) for the
-production setup (`isolcpus`, `nohz_full`, `SCHED_FIFO`).
+Every number below is pasted from a committed run in
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md); `scripts/update_readme.py` refuses
+to let the two drift. Container numbers are what we have; isolated-core numbers
+are pending and are **not** predicted here.
 
-### Order flow replay — 500K synthetic events
+<!-- BENCH:START -->
+### Order flow replay — 500K synthetic events (Ubuntu 24.04, GCC 13.3, x86-64 container, no core isolation)
 
 | Metric | Value |
 |--------|-------|
-| Submit latency p50 | **28 ns** |
-| Submit latency p90 | 30 ns |
-| Submit latency p99 | 43 ns |
-| Submit latency p99.9 | 213 ns |
+| Submit latency p50 | **38 ns** |
+| Submit latency p99 | 50 ns |
+| Submit latency p99.9 | 238 ns |
+<!-- BENCH:END -->
 
-p99 spike is an L2 miss on cold `order_id` hash lookup. p99.9 is scheduler
-jitter from the container. On an isolated core: p99 converges to 56–84 ns
-(2–3× p50).
+p99.9 is scheduler jitter from the container. See
+[docs/linux-tuning.md](docs/linux-tuning.md) for the isolated-core setup;
+the table will be replaced by an isolated run when one is recorded.
 
 ### AVX2 vs scalar `find_level` — N=128 price levels, 5M iterations
 
@@ -152,21 +181,10 @@ Expected probe length: **1.5 at 50% load**.
 
 ---
 
-## Profiling
-
-See [PROFILING.md](PROFILING.md) for:
-- Full RDTSC benchmark methodology
-- Cache behaviour analysis (why SoA gives 0% L1 miss)
-- Branch prediction analysis (why AVX2 reduces mispredictions 4×)
-- Predicted `perf stat` output (IPC, cache-miss %, branch-miss %)
-- Linux tuning guide (`isolcpus`, `SCHED_FIFO`, ASLR disable)
-
----
-
 ## Project Layout
 
 ```
-options-engine/
+lob-engine/
 ├── include/
 │   ├── core/
 │   │   ├── types.hpp           # Price, Qty, Order, ExecutionReport
@@ -196,7 +214,6 @@ options-engine/
 ├── scripts/
 │   ├── build.sh                # Build + test + optional benchmark driver
 │   └── profile.sh              # perf record + FlameGraph generation
-├── PROFILING.md                # Committed perf methodology + cache analysis
 ├── BENCHMARK_RESULTS.md        # Committed benchmark numbers
 └── .github/workflows/ci.yml    # Release, TSan, ASan, clang-tidy
 ```

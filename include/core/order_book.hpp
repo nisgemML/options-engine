@@ -1,10 +1,10 @@
 #pragma once
 
 #include "core/types.hpp"
+#include "util/function_ref.hpp"
 #include "util/allocator.hpp"
 #include <array>
 #include <cstdint>
-#include <functional>
 #include <span>
 
 namespace engine {
@@ -23,7 +23,8 @@ public:
     static constexpr std::size_t kMaxLevels = 4096;
     static constexpr std::size_t kMaxOrders = 65536;
 
-    using MatchCallback = std::function<void(const ExecutionReport&)>;
+    // Non-owning: the callable must outlive the book. See util/function_ref.hpp.
+    using MatchCallback = util::function_ref<void(const ExecutionReport&)>;
 
     explicit OrderBook(SymbolId symbol, MatchCallback on_match);
 
@@ -63,7 +64,9 @@ public:
         // Parallel arrays for each order slot.
         std::array<OrderId,  kMaxOrders> ids;
         std::array<Qty,      kMaxOrders> qtys;
-        std::array<uint32_t, kMaxOrders> nexts;
+        std::array<uint32_t, kMaxOrders> nexts;       // live doubly-linked list: next
+        std::array<uint32_t, kMaxOrders> prevs;       // live doubly-linked list: prev
+        std::array<uint32_t, kMaxOrders> free_nexts;  // free-list chain (separate from nexts)
         // Store price (not level index) — stable across remove_level() shifts.
         std::array<Price,    kMaxOrders> prices;
 
@@ -98,6 +101,7 @@ public:
 
 private:
     void try_match(Order& incoming) noexcept;
+    [[nodiscard]] Qty available_liquidity(const Order& incoming) const noexcept;
     void remove_order_from_level(uint8_t side_idx, uint32_t level_idx,
                                  uint32_t slot) noexcept;
 

@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstdio>
 #include <vector>
+#include <functional>
 #include <random>
 
 using namespace engine;
@@ -38,11 +39,19 @@ struct FillRecord {
     Qty     qty;
 };
 
-static OrderBook make_book(std::vector<FillRecord>& fills) {
-    return OrderBook(0, [&fills](const ExecutionReport& r) {
-        fills.push_back({ r.order_id, r.contra_order_id, r.exec_price, r.exec_qty });
-    });
-}
+// The match callback is a non-owning function_ref, so the sink must live
+// at least as long as the book. Bundle them.
+struct BookFixture {
+    std::vector<FillRecord>& fills;
+    std::function<void(const ExecutionReport&)> sink;
+    OrderBook book;
+    explicit BookFixture(std::vector<FillRecord>& f)
+        : fills(f),
+          sink([&f](const ExecutionReport& r) {
+              f.push_back({ r.order_id, r.contra_order_id, r.exec_price, r.exec_qty });
+          }),
+          book(0, sink) {}
+};
 
 static Order make_order(OrderId id, Side side, Price price, Qty qty,
                          OrderType type = OrderType::Limit) {
@@ -62,7 +71,8 @@ static Order make_order(OrderId id, Side side, Price price, Qty qty,
 
 static void test_simple_match() {
     std::vector<FillRecord> fills;
-    auto book = make_book(fills);
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
 
     // Post a resting sell at 100.
     book.add_order(make_order(1, Side::Sell, to_price(100.0), 200));
@@ -84,7 +94,8 @@ static void test_simple_match() {
 
 static void test_price_time_priority() {
     std::vector<FillRecord> fills;
-    auto book = make_book(fills);
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
 
     // Two resting sells at same price — order 1 posted first.
     book.add_order(make_order(1, Side::Sell, to_price(50.0), 100));
@@ -105,7 +116,8 @@ static void test_price_time_priority() {
 
 static void test_cancel_prevents_fill() {
     std::vector<FillRecord> fills;
-    auto book = make_book(fills);
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
 
     book.add_order(make_order(1, Side::Sell, to_price(100.0), 200));
     bool cancelled = book.cancel_order(1);
@@ -121,7 +133,8 @@ static void test_cancel_prevents_fill() {
 
 static void test_partial_fill() {
     std::vector<FillRecord> fills;
-    auto book = make_book(fills);
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
 
     book.add_order(make_order(1, Side::Sell, to_price(100.0), 50));
     // Buy for 200 — only 50 available.
@@ -140,7 +153,8 @@ static void test_partial_fill() {
 
 static void test_spread() {
     std::vector<FillRecord> fills;
-    auto book = make_book(fills);
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
 
     // Spread: bid=99, ask=101 — no cross, no match.
     book.add_order(make_order(1, Side::Buy,  to_price(99.0),  100));
@@ -154,7 +168,8 @@ static void test_spread() {
 
 static void test_market_order() {
     std::vector<FillRecord> fills;
-    auto book = make_book(fills);
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
 
     book.add_order(make_order(1, Side::Sell, to_price(100.0), 200));
     auto mkt = make_order(2, Side::Buy, 0, 150, OrderType::Market);
@@ -168,7 +183,8 @@ static void test_market_order() {
 
 static void test_invariants_random() {
     std::vector<FillRecord> fills;
-    auto book = make_book(fills);
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
     std::mt19937_64 rng(42);
 
     auto rand_price = [&]() { return to_price(99.0 + (rng() % 5) * 0.5); };

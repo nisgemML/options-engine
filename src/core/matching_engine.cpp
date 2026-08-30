@@ -19,7 +19,9 @@ bool MatchingEngine::register_symbol(SymbolId id) {
 
     books_[id] = std::make_unique<OrderBook>(
         id,
-        [this](const ExecutionReport& rpt) { on_execution(rpt); }
+        OrderBook::MatchCallback(this, [](void* ctx, const ExecutionReport& rpt) {
+            static_cast<MatchingEngine*>(ctx)->on_execution(rpt);
+        })
     );
     return true;
 }

@@ -123,3 +123,8 @@ jobs:
           assert rate > 1.0, f'Throughput regression: {rate:.2f} M/s < 1.0 M/s threshold'
           print(f'Throughput OK: {rate:.2f} M msgs/sec')
           "
+  readme-consistency:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/update_readme.py --check

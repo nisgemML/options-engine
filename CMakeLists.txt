@@ -84,6 +84,16 @@ add_executable(test_mpmc tests/test_mpmc.cpp)
 target_link_libraries(test_mpmc PRIVATE engine_core)
 add_test(NAME MPMC COMMAND test_mpmc)
 
+add_executable(bench_avx2 bench/bench_avx2.cpp)
+target_link_libraries(bench_avx2 PRIVATE engine_core)
+
+add_executable(bench_multisymbol bench/bench_multisymbol.cpp)
+target_link_libraries(bench_multisymbol PRIVATE engine_core)
+
+add_executable(test_conservation tests/test_conservation.cpp)
+target_link_libraries(test_conservation PRIVATE engine_core)
+add_test(NAME Conservation COMMAND test_conservation 1 1000000)
+
 add_executable(test_histogram tests/test_histogram.cpp)
 target_link_libraries(test_histogram PRIVATE engine_core)
 add_test(NAME Histogram COMMAND test_histogram)

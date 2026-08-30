@@ -91,8 +91,8 @@ void OrderBook::Side::remove_level(uint32_t idx) noexcept {
 
 void OrderBook::SlotPool::init() noexcept {
     for (uint32_t i = 0; i < kMaxOrders - 1; ++i)
-        nexts[i] = i + 1;
-    nexts[kMaxOrders - 1] = NULL_IDX;
+        free_nexts[i] = i + 1;
+    free_nexts[kMaxOrders - 1] = NULL_IDX;
     free_head = 0;
     used      = 0;
 }
@@ -100,13 +100,13 @@ void OrderBook::SlotPool::init() noexcept {
 uint32_t OrderBook::SlotPool::alloc() noexcept {
     if (free_head == NULL_IDX) [[unlikely]] return NULL_IDX;
     uint32_t idx = free_head;
-    free_head = nexts[idx];
+    free_head = free_nexts[idx];
     ++used;
     return idx;
 }
 
 void OrderBook::SlotPool::free_slot(uint32_t idx) noexcept {
-    nexts[idx] = free_head;
+    free_nexts[idx] = free_head;
     free_head  = idx;
     --used;
 }
@@ -174,16 +174,18 @@ bool OrderBook::add_order(const Order& order) noexcept {
     Order o = order;
 
     if (o.type == OrderType::Market || o.type == OrderType::IOC || o.type == OrderType::FOK) {
-        try_match(o);
-        if (o.type == OrderType::FOK && !o.is_filled()) {
+        // FOK is all-or-none and atomic: check liquidity BEFORE executing so a
+        // rejected FOK never leaves partial fills behind.
+        if (o.type == OrderType::FOK && available_liquidity(o) < o.qty_remaining) {
             ++stat_rejected_;
             return false;
         }
-        if (o.is_filled() || o.type == OrderType::IOC || o.type == OrderType::FOK)
-            return true;
-    } else {
         try_match(o);
+        // Market, IOC, and (now fully filled) FOK never rest. Any remainder
+        // is expired, not booked.
+        return true;
     }
+    try_match(o);
 
     if (o.is_filled()) return true;
 
@@ -206,14 +208,19 @@ bool OrderBook::add_order(const Order& order) noexcept {
     slots_.prices[slot]     = o.price;
 
     // O(1) append using tail_idxs — no traversal needed.
+    // Maintain doubly-linked list: set prev of new slot = old tail,
+    // then advance tail. The old head path sets prev = NULL_IDX.
     if (side.head_idxs[lvl_idx] == NULL_IDX) {
         // First order at this level.
+        slots_.prevs[slot]      = NULL_IDX;
         side.head_idxs[lvl_idx] = slot;
         side.tail_idxs[lvl_idx] = slot;
     } else {
         // Link new slot after current tail, then advance tail pointer.
-        slots_.nexts[side.tail_idxs[lvl_idx]] = slot;
-        side.tail_idxs[lvl_idx]               = slot;
+        const uint32_t old_tail = side.tail_idxs[lvl_idx];
+        slots_.nexts[old_tail]  = slot;
+        slots_.prevs[slot]      = old_tail;
+        side.tail_idxs[lvl_idx] = slot;
     }
 
     side.qtys[lvl_idx]         += o.qty_remaining;
@@ -266,6 +273,22 @@ bool OrderBook::modify_order(OrderId order_id, Qty new_qty) noexcept {
     return true;
 }
 
+Qty OrderBook::available_liquidity(const Order& incoming) const noexcept {
+    const bool  buy  = incoming.is_buy();
+    const Side& side = buy ? asks_ : bids_;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < side.count; ++i) {
+        const Price px = side.prices[i];
+        if (incoming.type != OrderType::Market) {
+            if (buy  && incoming.price < px) break;
+            if (!buy && incoming.price > px) break;
+        }
+        total += side.qtys[i];
+        if (total >= incoming.qty_remaining) break;   // early out
+    }
+    return Qty(std::min<uint64_t>(total, UINT32_MAX));
+}
+
 void OrderBook::try_match(Order& incoming) noexcept {
     bool aggressor_is_buy = incoming.is_buy();
     Side& passive_side    = aggressor_is_buy ? asks_ : bids_;
@@ -273,7 +296,9 @@ void OrderBook::try_match(Order& incoming) noexcept {
     while (incoming.qty_remaining > 0 && passive_side.count > 0) {
         Price best_passive = passive_side.prices[0];
 
-        if (incoming.type == OrderType::Limit) {
+        // IOC and FOK are limit orders with a time-in-force; only a true
+        // Market order ignores its price.
+        if (incoming.type != OrderType::Market) {
             if (aggressor_is_buy  && incoming.price < best_passive) break;
             if (!aggressor_is_buy && incoming.price > best_passive) break;
         }
@@ -310,6 +335,8 @@ void OrderBook::try_match(Order& incoming) noexcept {
                 // If the level is now empty, reset tail too.
                 if (passive_side.head_idxs[0] == NULL_IDX)
                     passive_side.tail_idxs[0] = NULL_IDX;
+                else
+                    slots_.prevs[passive_side.head_idxs[0]] = NULL_IDX;
                 passive_side.order_counts[0] -= 1;
                 index_.remove(slots_.ids[slot]);
                 slots_.free_slot(slot);
@@ -330,22 +357,14 @@ void OrderBook::remove_order_from_level(uint8_t side_idx, uint32_t level_idx,
     side.qtys[level_idx]         -= slots_.qtys[slot];
     side.order_counts[level_idx] -= 1;
 
-    // Unlink from intrusive chain.
-    if (side.head_idxs[level_idx] == slot) {
-        side.head_idxs[level_idx] = slots_.nexts[slot];
-        // If the removed slot was also the tail, reset tail.
-        if (side.tail_idxs[level_idx] == slot)
-            side.tail_idxs[level_idx] = NULL_IDX;
-    } else {
-        uint32_t prev = side.head_idxs[level_idx];
-        while (prev != NULL_IDX && slots_.nexts[prev] != slot)
-            prev = slots_.nexts[prev];
-        if (prev != NULL_IDX) {
-            slots_.nexts[prev] = slots_.nexts[slot];
-            // If the removed slot was the tail, the new tail is prev.
-            if (side.tail_idxs[level_idx] == slot)
-                side.tail_idxs[level_idx] = prev;
-        }
+    // O(1) unlink — doubly-linked intrusive list via slots_.prevs[].
+    {
+        const uint32_t prev = slots_.prevs[slot];
+        const uint32_t next = slots_.nexts[slot];
+        if (prev != NULL_IDX) slots_.nexts[prev] = next;
+        else                  side.head_idxs[level_idx] = next;
+        if (next != NULL_IDX) slots_.prevs[next] = prev;
+        else                  side.tail_idxs[level_idx] = prev;
     }
 
     slots_.free_slot(slot);

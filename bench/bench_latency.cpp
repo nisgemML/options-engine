@@ -42,7 +42,8 @@ static void bench_order_book() {
 
     std::vector<ExecutionReport> fills;
     fills.reserve(1 << 20);
-    OrderBook book(0, [&](const ExecutionReport& r){ fills.push_back(r); });
+    auto sink = [&](const ExecutionReport& r){ fills.push_back(r); };
+    OrderBook book(0, sink);
 
     uint64_t id = 1;
     auto make = [&](Side s, Price p, Qty q) {

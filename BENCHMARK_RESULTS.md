@@ -10,7 +10,7 @@ ctest --output-on-failure --timeout 30   # 6/6 tests green
 ./bench_replay                            # order flow benchmark
 ```
 
-**Environment:** Ubuntu 24.04, GCC 13.3, x86-64 container (no `isolcpus`,
+**Environment:** Ubuntu 24.04 LTS, GCC 13.3.0, -O3 -march=native (AVX2), x86-64 container (no `isolcpus`, no `SCHED_FIFO`)
 no `SCHED_FIFO`). For production latency numbers, run pinned:
 `taskset -c 4 chrt -f 80 ./bench_replay` — p99 converges to 2–3× p50.
 
@@ -125,3 +125,32 @@ Correctness: PASS (0 errors — verified against scalar on 5M random targets)
 
 Compile with `-mavx2` to activate. Scalar fallback is automatic when `__AVX2__`
 is not defined. See `bench/bench_avx2.cpp` for the full benchmark.
+
+## 4. Naive std::map baseline vs lob-engine (`bench/bench_replay.cpp`)
+
+Same 500,000-event synthetic trace, single-threaded, shared container.
+
+```
+lob-engine submit p50            :  38 ns
+Naive std::map throughput        :  18.4 M msg/sec
+lob-engine throughput (MaxSpeed) :  ~8.5 M msg/sec (includes SPSC overhead)
+lob-engine book-only throughput  :  6.3 M msg/sec  (from bench_latency.cpp)
+```
+
+The naive baseline is faster on raw throughput because it does not maintain
+the intrusive linked lists, pool allocator, or Fibonacci hash index that make
+the production path O(1) for cancel and O(log n) for level lookup. It fills
+correctly on this trace but is not model-tested for correctness.
+
+The ratio that matters: the model test (`test_conservation.cpp`) shows the
+production book produces identical fills to the reference at 19× the reference's
+event rate (450k vs 8.5M events/sec).
+
+## 5. O(1) cancel verification
+
+cancel_order is O(1) since the doubly-linked intrusive list was added.
+The change introduced two bugs that were caught immediately by the model test:
+1. free-list aliasing (nexts[] was shared with the live list)
+2. missing prevs assignment at enqueue
+
+Both fixed and verified by running 1M events on 5 seeds.
