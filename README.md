@@ -43,7 +43,7 @@ to let the two drift. Container numbers are what we have; isolated-core numbers
 are pending and are **not** predicted here.
 
 <!-- BENCH:START -->
-### Order flow replay — 500K synthetic events (Ubuntu 24.04, GCC 13.3, x86-64 container, no core isolation)
+### Order flow replay — 500K synthetic events (Ubuntu 24.04 LTS, GCC 13.3.0, -O3 -march=native (AVX2), x86-64 container (no `isolcpus`, no `SCHED_FIFO`))
 
 | Metric | Value |
 |--------|-------|
