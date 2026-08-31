@@ -36,8 +36,9 @@ on this machine, in a shared container (no `isolcpus`, no `SCHED_FIFO`).
 `scripts/update_readme.py` diffs this file against README.md's `<!--
 BENCH:START/END -->` block and fails if they've drifted.
 
-**Environment:** Ubuntu 24.04 LTS, GCC 13.3.0, -O3 -march=native (AVX2), x86-64 container (no `isolcpus`,
-no `SCHED_FIFO`). For production latency numbers, run pinned:
+**Environment:** Ubuntu 24.04 LTS, GCC 13.3.0, -O3 -march=native (AVX2), x86-64 container (no `isolcpus`, no `SCHED_FIFO`)
+
+For production latency numbers, run pinned:
 `taskset -c 4 chrt -f 80 ./bench_replay` — p99 converges to 2–3× p50.
 
 ---
