@@ -271,6 +271,45 @@ static void test_fok_atomicity() {
     }
 }
 
+static void test_self_trade_prevention() {
+    std::vector<FillRecord> fills;
+    BookFixture fx(fills);
+    OrderBook& book = fx.book;
+
+    // Two resting sells at the same price: order 1 is account A, order 2
+    // (behind it) is account B.
+    Order resting1 = make_order(1, Side::Sell, to_price(50.0), 100);
+    resting1.account_id = 111;
+    book.add_order(resting1);
+
+    Order resting2 = make_order(2, Side::Sell, to_price(50.0), 100);
+    resting2.account_id = 222;
+    book.add_order(resting2);
+
+    // An account-A buy hits its own resting order at the head of the
+    // queue: must not match at all (walling, not skipping to order 2 —
+    // skipping would violate order 2's priority), and must not rest
+    // through a price it refused, or the book ends up crossed.
+    Order aggr = make_order(3, Side::Buy, to_price(50.0), 60);
+    aggr.account_id = 111;
+    bool ok = book.add_order(aggr);
+    CHECK(ok, "STP-walled order still accepted (just doesn't match/rest)");
+    CHECK(fills.empty(), "No fill against our own resting order");
+
+    BestQuote q = book.best_quote();
+    CHECK(q.bid_price == PRICE_INVALID, "Remainder does not rest through the wall (book stays uncrossed)");
+    CHECK(q.ask_price == to_price(50.0), "Ask side untouched by the walled attempt");
+
+    // An account-C buy at the same price is unaffected — it should match
+    // order 1 normally (no self-trade relationship).
+    Order aggr2 = make_order(4, Side::Buy, to_price(50.0), 40);
+    aggr2.account_id = 333;
+    book.add_order(aggr2);
+    CHECK(fills.size() == 1, "Unrelated account matches normally");
+    if (!fills.empty())
+        CHECK(fills[0].contra_id == 1, "Matched against order 1 (front of queue, no STP conflict)");
+}
+
 // ── Property-based test: random order stream ──────────────────────────────────
 
 static void test_invariants_random() {
@@ -328,6 +367,7 @@ int main() {
     test_modify_increase_loses_priority();
     test_ioc_remainder_expires();
     test_fok_atomicity();
+    test_self_trade_prevention();
     test_invariants_random();
 
     printf("\nResults: %d passed, %d failed\n", passed, failed);

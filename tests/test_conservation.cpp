@@ -30,7 +30,7 @@ using namespace engine;
 struct Fill { OrderId aggr, passive; Price px; Qty qty; };
 
 // ── Reference model ──────────────────────────────────────────────────────────
-struct RefOrder { OrderId id; Qty rem; };
+struct RefOrder { OrderId id; Qty rem; uint32_t account = 0; };
 struct RefBook {
     std::map<Price, std::deque<RefOrder>, std::greater<Price>> bids;  // best first
     std::map<Price, std::deque<RefOrder>, std::less<Price>>    asks;  // best first
@@ -45,13 +45,14 @@ struct RefBook {
     size_t resting_count = 0;
 
     template<typename Passive>
-    Qty sweep(OrderId id, Qty qty, Price limit, bool is_buy, bool limited, Passive& side) {
+    Qty sweep(OrderId id, Qty qty, Price limit, bool is_buy, bool limited, uint32_t account, bool* walled, Passive& side) {
         while (qty > 0 && !side.empty()) {
             auto it = side.begin();
             Price px = it->first;
             if (limited && (is_buy ? limit < px : limit > px)) break;
             auto& q = it->second;
             while (qty > 0 && !q.empty()) {
+                if (account != 0 && account == q.front().account) { *walled = true; return qty; }  // STP wall
                 Qty f = std::min(qty, q.front().rem);
                 fills.push_back({id, q.front().id, px, f});
                 qty -= f; q.front().rem -= f;
@@ -62,11 +63,14 @@ struct RefBook {
         return qty;
     }
     template<typename Passive>
-    Qty available(Price limit, bool is_buy, Passive& side) {
+    Qty available(Price limit, bool is_buy, uint32_t account, Passive& side) {
         Qty total = 0;
         for (auto& [px, q] : side) {
             if (is_buy ? limit < px : limit > px) break;
-            for (auto& o : q) total += o.rem;
+            for (auto& o : q) {
+                if (account != 0 && account == o.account) return total;  // STP wall
+                total = Qty(std::min<uint64_t>(uint64_t(total) + o.rem, UINT32_MAX));
+            }
         }
         return total;
     }
@@ -81,19 +85,24 @@ struct RefBook {
         bool buy = o.is_buy();
         bool limited = o.type != OrderType::Market;
         if (o.type == OrderType::FOK) {
-            Qty avail = buy ? available(o.price, buy, asks) : available(o.price, buy, bids);
+            Qty avail = buy ? available(o.price, buy, o.account_id, asks) : available(o.price, buy, o.account_id, bids);
             if (avail < o.qty) return {0, 0, true};
         }
-        Qty rem = buy ? sweep(o.id, o.qty, o.price, buy, limited, asks)
-                      : sweep(o.id, o.qty, o.price, buy, limited, bids);
+        bool walled = false;
+        Qty rem = buy ? sweep(o.id, o.qty, o.price, buy, limited, o.account_id, &walled, asks)
+                      : sweep(o.id, o.qty, o.price, buy, limited, o.account_id, &walled, bids);
         Qty filled = o.qty - rem;
-        if (rem > 0 && o.type == OrderType::Limit) {
+        // Walled: refusing to rest the remainder is what keeps the book
+        // from ending up crossed against our own resting order — mirrors
+        // add_order(); same externally visible outcome as an unfilled
+        // IOC remainder (expires, doesn't rest).
+        if (rem > 0 && o.type == OrderType::Limit && !walled) {
             if (resting_count >= max_orders) return {0, filled, false, true};
-            if (buy) bids[o.price].push_back({o.id, rem}); else asks[o.price].push_back({o.id, rem});
+            if (buy) bids[o.price].push_back({o.id, rem, o.account_id}); else asks[o.price].push_back({o.id, rem, o.account_id});
             ++resting_count;
             return {rem, filled, false};
         }
-        return {0, filled, false};   // market/IOC remainder expires, FOK fully filled
+        return {0, filled, false};   // market/IOC/STP-walled remainder expires, FOK fully filled
     }
     template<typename S> bool erase_from(S& side, OrderId id, Qty* out) {
         for (auto it = side.begin(); it != side.end(); ++it)
@@ -113,7 +122,7 @@ struct RefBook {
                 if (q->id == id) {
                     *delta = q->rem - nq;
                     if (nq > q->rem) {
-                        RefOrder moved{q->id, nq};
+                        RefOrder moved{q->id, nq, q->account};
                         it->second.erase(q);
                         it->second.push_back(moved);
                     } else {
@@ -179,6 +188,11 @@ int main(int argc, char** argv) {
             // Prices clustered around 100.00 in 1c ticks so books cross often.
             o.price = to_price(100.0) + Price((int64_t(rng() % 41) - 20) * 10'000);
             o.qty = Qty(1 + rng() % 500); o.qty_remaining = o.qty;
+            // ~30% of traffic carries an account id (from a small pool of 8)
+            // so self-trade prevention actually gets exercised by the
+            // fuzzer; the rest stay untracked (account_id 0), matching how
+            // every other existing caller in the codebase constructs Order.
+            if (rng() % 100 < 30) o.account_id = 1 + uint32_t(rng() % 8);
             int t = int(rng() % 100);
             o.type = t < 80 ? OrderType::Limit : t < 88 ? OrderType::Market : t < 95 ? OrderType::IOC : OrderType::FOK;
             o.status = OrderStatus::New;
@@ -212,8 +226,8 @@ int main(int argc, char** argv) {
             } else {
                 if (!ok) fail(i, "engine rejected an order the model accepted");
                 if (eng_filled != out.filled) fail(i, "filled qty differs from model");
-                if (o.type == OrderType::Limit) { if (out.resting) live.push_back(o.id); }
-                else expired += o.qty - eng_filled;
+                if (o.type == OrderType::Limit && out.resting) live.push_back(o.id);
+                else expired += o.qty - eng_filled;   // fully filled (0), or a non-resting remainder — market/IOC/STP-walled alike
             }
         } else if (roll < 90) {
             // ── Cancel ──

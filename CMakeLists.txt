@@ -30,6 +30,13 @@ if(ASAN)
     add_link_options(-fsanitize=address)
 endif()
 
+# Undefined-behavior sanitizer support
+option(UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+if(UBSAN)
+    add_compile_options(-fsanitize=undefined -fno-sanitize-recover=undefined -g -O1)
+    add_link_options(-fsanitize=undefined)
+endif()
+
 find_package(Threads REQUIRED)
 
 # ── Core library ─────────────────────────────────────────────────────────────
@@ -109,6 +116,18 @@ set_tests_properties(
 # A longer (10M-event) run is not part of the default ctest pass — same
 # binary, invoked with a bigger event count and a longer timeout from a
 # dedicated CI job (see .github/workflows/ci.yml: conservation-long).
+
+add_executable(replay_trace tools/replay_trace.cpp)
+target_link_libraries(replay_trace PRIVATE engine_core)
+# Record once at configure-adjacent time isn't right for CMake, so this is
+# a ctest step: record a trace, then replay it in a second process and
+# byte-diff the fills — proves determinism (same input -> same output)
+# independent of test_conservation.cpp's correctness-against-a-model claim.
+add_test(NAME ReplayDeterminism
+         COMMAND ${CMAKE_COMMAND}
+                 -DREPLAY_BIN=$<TARGET_FILE:replay_trace>
+                 -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_replay_determinism.cmake)
 
 add_executable(test_histogram tests/test_histogram.cpp)
 target_link_libraries(test_histogram PRIVATE engine_core)

@@ -34,6 +34,20 @@ that documented boundary isn't mistaken for a bug.
 
 `tests/test_conservation.cpp`. Runs in CI under ASan, UBSan, and TSan.
 
+Separately, `tools/replay_trace.cpp` proves determinism directly: it
+records a binary trace of a random event stream and the fills it
+produced, then replays that trace through a **fresh** `OrderBook` in a
+second process and byte-diffs the fills. This checks something the
+differential test doesn't — that the same input reliably reproduces the
+same output byte-for-byte, independent of whether that output matches
+the reference model. Building it caught two real bugs by running it
+under UBSan rather than trusting a clean compile: a misaligned-reference
+UB from packing the on-disk struct, and — more subtly — uninitialized
+struct padding that made two independent recordings of the identical
+input produce non-identical files (verified fixed with a direct file
+`cmp` across two separate process runs, not just the tool's own
+verdict). Runs as the `ReplayDeterminism` ctest entry.
+
 This test found five bugs, all now fixed:
 1. an unfilled **market order was booked as a resting limit** at its price;
 2. **IOC/FOK ignored their limit price** and swept through the book like a market order;
@@ -226,8 +240,15 @@ lob-engine/
 │   ├── bench_avx2.cpp          # AVX2 vs scalar find_level comparison
 │   ├── bench_latency.cpp       # Per-operation latency breakdown
 │   ├── bench_throughput.cpp    # Sustained msgs/sec
+│   ├── bench_multisymbol.cpp   # Multi-shard throughput/latency, pinned cores
 │   └── bench_cache.cpp         # SoA vs AoS speedup at each book depth
-├── tests/                      # 6 suites, 171 assertions, 0 failures
+├── tools/
+│   └── replay_trace.cpp        # Record/replay a trace, byte-diff fills —
+│                                # determinism check, distinct from
+│                                # include/core/replay.hpp's latency replay
+├── tests/                      # 8 suites + ReplayDeterminism, 192+ assertions
+├── cmake/
+│   └── run_replay_determinism.cmake  # ctest driver for ReplayDeterminism
 ├── fuzz/                       # libFuzzer harness for wire parser
 ├── docs/
 │   ├── design.md               # Rationale for every non-obvious decision
@@ -236,7 +257,7 @@ lob-engine/
 │   ├── build.sh                # Build + test + optional benchmark driver
 │   └── profile.sh              # perf record + FlameGraph generation
 ├── BENCHMARK_RESULTS.md        # Committed benchmark numbers
-└── .github/workflows/ci.yml    # Release, TSan, ASan, clang-tidy
+└── .github/workflows/ci.yml    # Release, TSan, ASan, UBSan, conservation-long
 ```
 
 ---
@@ -270,14 +291,15 @@ ctest --test-dir build --output-on-failure
 
 | Suite | Assertions | What it covers |
 |-------|-----------|----------------|
-| `test_order_book` | 37 | Price-time priority, FIFO, cancel, partial fills, modify increase/decrease priority, IOC remainder expiry, FOK atomicity, 100K-event property invariant |
+| `test_order_book` | 43 | Price-time priority, FIFO, cancel, partial fills, modify increase/decrease priority, IOC remainder expiry, FOK atomicity, self-trade prevention, 100K-event property invariant |
 | `test_spsc` | 12 | 2M-item FIFO ordering, wrap-around stress, concurrent — TSan-clean |
 | `test_mpmc` | 24 | 1P×1C through 8P×4C — every item received exactly once |
 | `test_matching` | 8 | End-to-end cross, cancel-before-match, multi-symbol isolation |
 | `test_allocator` | 84 | Exhaust/recover, free-list integrity, 1M alloc/free cycles |
 | `test_histogram` | 21 | Bucket indexing, percentile accuracy, concurrent recording |
-| `test_conservation` | 1M events × 5 seeds | Model-based differential fuzzer — see Correctness above |
-| **Total (unit/property)** | **186** | **0 failures** |
+| `test_conservation` | 1M events × 5 seeds (+10M in a dedicated CI job) | Model-based differential fuzzer — see Correctness above |
+| `replay_trace` (`ReplayDeterminism`) | 500K-event trace | Record → replay in a fresh process → fills byte-identical |
+| **Total (unit/property)** | **192** | **0 failures** |
 
 ---
 

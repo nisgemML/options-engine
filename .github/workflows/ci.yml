@@ -93,6 +93,34 @@ jobs:
           ASAN_OPTIONS: "halt_on_error=1 detect_leaks=1"
         run: ctest --test-dir build-asan --output-on-failure --timeout 180
 
+  # ── UndefinedBehaviorSanitizer ────────────────────────────────────────────
+  ubsan:
+    name: UndefinedBehaviorSanitizer
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build g++-12
+
+      - name: Configure (UBSan)
+        run: |
+          CXX=g++-12 cmake -S . -B build-ubsan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUBSAN=ON
+
+      - name: Build
+        run: cmake --build build-ubsan --parallel $(nproc)
+
+      - name: Test under UBSan
+        env:
+          UBSAN_OPTIONS: "halt_on_error=1 print_stacktrace=1"
+        run: ctest --test-dir build-ubsan --output-on-failure --timeout 180
+
   # ── Benchmark smoke ───────────────────────────────────────────────────────
   bench-smoke:
     name: Benchmark Smoke

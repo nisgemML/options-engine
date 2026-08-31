@@ -50,7 +50,13 @@ struct alignas(64) Order {
     Side      side;
     OrderType type;
     OrderStatus status;
-    uint8_t   _pad[5];
+    // Self-trade prevention key. 0 = untracked/disabled — matching never
+    // treats a 0 as equal to another 0, so every existing call site that
+    // doesn't set this (tests, benchmarks, MatchingEngine) is unaffected.
+    // See OrderBook::try_match's STP check and LIMITATIONS.md for the
+    // (conservative) policy this implements.
+    uint32_t  account_id = 0;
+    uint8_t   _pad[1];
 
     [[nodiscard]] bool is_buy()  const noexcept { return side == Side::Buy; }
     [[nodiscard]] bool is_sell() const noexcept { return side == Side::Sell; }

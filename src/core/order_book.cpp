@@ -185,9 +185,20 @@ bool OrderBook::add_order(const Order& order) noexcept {
         // is expired, not booked.
         return true;
     }
-    try_match(o);
+    bool stp_walled = try_match(o);
 
     if (o.is_filled()) return true;
+
+    if (stp_walled) {
+        // Refused to match through this price because the resting order
+        // there is ours (self-trade prevention). Resting the remainder
+        // anyway would leave the book crossed against that price, so the
+        // remainder is cancelled instead of booked — same externally
+        // visible outcome as an IOC's unfilled remainder. See
+        // LIMITATIONS.md.
+        ++stat_self_trade_prevented_;
+        return true;
+    }
 
     bool is_bid = o.is_buy();
     Side& side  = is_bid ? bids_ : asks_;
@@ -214,6 +225,7 @@ bool OrderBook::add_order(const Order& order) noexcept {
     }
 
     slots_.ids[slot]        = o.id;
+    slots_.accounts[slot]   = o.account_id;
     slots_.qtys[slot]       = o.qty_remaining;
     slots_.nexts[slot]      = NULL_IDX;
     // Store price instead of index — index shifts on remove_level.
@@ -323,15 +335,31 @@ Qty OrderBook::available_liquidity(const Order& incoming) const noexcept {
             if (buy  && incoming.price < px) break;
             if (!buy && incoming.price > px) break;
         }
-        total += side.qtys[i];
-        if (total >= incoming.qty_remaining) break;   // early out
+        // Walk this level's queue rather than summing side.qtys[i] in one
+        // shot, so a same-account order anywhere in the queue (an STP
+        // wall — see try_match) is accounted for exactly, not just one at
+        // a level's head. This is what keeps the FOK atomicity guarantee
+        // under STP: a FOK that passes this pre-check is guaranteed to
+        // fully fill in try_match, wall or no wall. Degrades to the same
+        // O(1)-per-level cost as before whenever account_id is 0
+        // (untracked) on either side, which is every existing caller.
+        uint32_t idx = side.head_idxs[i];
+        while (idx != NULL_IDX) {
+            if (incoming.account_id != 0 && incoming.account_id == slots_.accounts[idx])
+                return Qty(std::min<uint64_t>(total, UINT32_MAX));
+            total += slots_.qtys[idx];
+            if (total >= incoming.qty_remaining)
+                return Qty(std::min<uint64_t>(total, UINT32_MAX));
+            idx = slots_.nexts[idx];
+        }
     }
     return Qty(std::min<uint64_t>(total, UINT32_MAX));
 }
 
-void OrderBook::try_match(Order& incoming) noexcept {
+bool OrderBook::try_match(Order& incoming) noexcept {
     bool aggressor_is_buy = incoming.is_buy();
     Side& passive_side    = aggressor_is_buy ? asks_ : bids_;
+    bool stp_walled = false;
 
     while (incoming.qty_remaining > 0 && passive_side.count > 0) {
         Price best_passive = passive_side.prices[0];
@@ -345,7 +373,20 @@ void OrderBook::try_match(Order& incoming) noexcept {
 
         // Always work level index 0 (best).
         while (passive_side.head_idxs[0] != NULL_IDX && incoming.qty_remaining > 0) {
-            uint32_t slot     = passive_side.head_idxs[0];
+            uint32_t slot = passive_side.head_idxs[0];
+
+            // Self-trade prevention: if the head-of-queue passive order
+            // belongs to the same (non-zero) account as the aggressor,
+            // stop matching entirely rather than skip past it — skipping
+            // would match a later-queued order first, violating FIFO for
+            // everyone behind it. The caller must NOT rest the aggressor's
+            // remainder in this case: since we refused to match through
+            // this price, resting here would leave the book crossed. See
+            // add_order() and LIMITATIONS.md.
+            if (incoming.account_id != 0 && incoming.account_id == slots_.accounts[slot]) {
+                return true;
+            }
+
             const Qty fill_qty = std::min(incoming.qty_remaining, slots_.qtys[slot]);
 
             // Update quantities.
@@ -387,6 +428,7 @@ void OrderBook::try_match(Order& incoming) noexcept {
         if (passive_side.order_counts[0] == 0)
             passive_side.remove_level(0);
     }
+    return stp_walled;
 }
 
 void OrderBook::remove_order_from_level(uint8_t side_idx, uint32_t level_idx,

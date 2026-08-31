@@ -40,6 +40,7 @@ public:
     [[nodiscard]] uint64_t  total_orders()    const noexcept { return stat_orders_; }
     [[nodiscard]] uint64_t  total_matches()   const noexcept { return stat_matches_; }
     [[nodiscard]] uint64_t  total_cancelled() const noexcept { return stat_cancelled_; }
+    [[nodiscard]] uint64_t  total_self_trade_prevented() const noexcept { return stat_self_trade_prevented_; }
 
     // ── Internal types exposed for the .cpp implementation ──────────────────
 
@@ -61,7 +62,16 @@ public:
     };
 
     struct SlotPool {
-        // Parallel arrays for each order slot.
+        // Parallel arrays for each order slot. No cache-line padding here
+        // (contrast with mpmc_queue.hpp's alignas(64) counters and
+        // multi_symbol_engine.hpp's alignas(64) shard fields): those pad
+        // against false sharing between *threads*. OrderBook itself is
+        // single-threaded per instance by design — one thread owns one
+        // book — so no other thread is ever touching an adjacent slot in
+        // these arrays concurrently, and padding would only cost L1
+        // density for no correctness or latency benefit. If that
+        // single-writer invariant ever changes (e.g. a lock-free
+        // multi-producer book), this comment is the place to revisit it.
         std::array<OrderId,  kMaxOrders> ids;
         std::array<Qty,      kMaxOrders> qtys;
         std::array<uint32_t, kMaxOrders> nexts;       // live doubly-linked list: next
@@ -69,6 +79,9 @@ public:
         std::array<uint32_t, kMaxOrders> free_nexts;  // free-list chain (separate from nexts)
         // Store price (not level index) — stable across remove_level() shifts.
         std::array<Price,    kMaxOrders> prices;
+        // Self-trade-prevention key, mirrors Order::account_id. Only
+        // meaningful for an allocated slot; read during try_match().
+        std::array<uint32_t, kMaxOrders> accounts;
 
         uint32_t free_head = 0;
         uint32_t used      = 0;
@@ -100,7 +113,7 @@ public:
     };
 
 private:
-    void try_match(Order& incoming) noexcept;
+    bool try_match(Order& incoming) noexcept;   // returns true if it stopped on an STP wall
     [[nodiscard]] Qty available_liquidity(const Order& incoming) const noexcept;
     void remove_order_from_level(uint8_t side_idx, uint32_t level_idx,
                                  uint32_t slot) noexcept;
@@ -117,6 +130,7 @@ private:
     uint64_t stat_matches_   = 0;
     uint64_t stat_cancelled_ = 0;
     uint64_t stat_rejected_  = 0;
+    uint64_t stat_self_trade_prevented_ = 0;
 };
 
 
